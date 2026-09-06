@@ -17,7 +17,7 @@
 
 ```
 ├── config.py                  # 全局配置 dataclass（唯一配置入口）
-├── train.py                   # 训练入口（两阶段：冻结→解冻微调）
+├── train.py                   # 训练入口（三阶段：冻结→末层→全量微调）
 ├── infer.py                   # 推理入口（FP16 + 批量滑窗 + 形态学后处理）
 ├── export_onnx.py             # ONNX 导出
 ├── data/
@@ -61,30 +61,31 @@ D:/work/anaconda/envs/unet_pro/python -c "from config import cfg; print(cfg)"
 
 ### Encoder: DINOv3 特征提取
 - **Backbone**: `facebook/dinov3-vitb16-pretrain-lvd1689m`
-- **patch_size=14**, 输入尺寸 `image_size=784`（56×14，保证整除）
-- 取最后 3 层 hidden_states，reshape 时去掉 CLS token (idx 0) 和 4 个 register tokens (last 4)
-- 所有层级输出相同空间分辨率 `[B, 768, 56, 56]`（ViT 不像 CNN 有下采样金字塔）
+- **patch_size=16**（以 backbone 配置为准），默认输入 `image_size=1024`，网格为64×64；非方形输入分别计算高宽
+- 取最后 3 层 hidden_states，token 顺序为 CLS、register、patch；按配置去掉前面的 CLS 和 register tokens
+- 所有层级输出相同空间分辨率 `[B, 768, H//16, W//16]`（ViT 不像 CNN 有下采样金字塔）
 
-### Decoder: FPN + UNet 混合
-- 3 层特征通过 1×1 卷积统一到 256 通道 → **同分辨率相加融合**（非 concat）
-- 融合后逐级 2× 上采样: 56→112→224→448→896
-- 每级一个 `ConvBlock`（Conv→BN→ReLU→Conv→BN→ReLU）
-- 最后 `F.interpolate` 精确到 `output_size`
-- 输出头: 1×1 Conv → 2 通道 logits
+### Decoder: DecoderV3
+- 默认 `use_detail_branch=True`：浅层CNN提供1/2、1/4、1/8细节，在前三次上采样后、残差块前投影相加。该开关已接入执行。
+- 旧结构检查点需关闭细节开关；新结构需训练，不允许静默忽略缺失权重。
+- 最后三层同分辨率特征分别经过 CBAM，再可学习加权融合。
+- 1×1 投影至512通道，四级残差上采样：512→256→128→64→32。
+- Segmentation Head 输出2通道，Boundary Head 输出1通道，最后插值到输入尺寸。
 
-### 两阶段训练
-- **Stage 1 (epoch 0-59)**: 冻结 backbone，仅训练 decoder，lr=1e-4
-- **Stage 2 (epoch 60-99)**: 解冻 backbone，全模型微调，lr=1e-5
-- Stage 2 切换时重建 optimizer + scheduler（剩余 epochs 走 cosine decay）
+### 渐进解冻与分层学习率
+- 默认epoch 0–9冻结骨干；10–29训练末4层；30起全量解冻。`full_unfreeze_epoch=-1`禁用最后阶段，`freeze_backbone=False`从起始全量微调。
+- head基准LR=1e-4，骨干末层=1e-5，向前逐层乘0.8；新解冻组独立预热3轮。
+- AdamW分组始终保留，阶段切换不丢动量。每轮开始从epoch计算LR与可训练掩码，按组比例设最低LR。
+- 新断点保存training_policy、optimizer、scaler、最佳指标与RNG。恢复需保持策略配置一致；旧格式不能直接恢复新优化器。
 
 ### 损失函数
-- `TotalLoss = 0.55×CE + 0.30×Dice + 0.15×Boundary`（实际代码中的权重）
-- 注意：`config.py` 中的权重参数 (`bce_weight`, `dice_weight`, `boundary_weight`, `connectivity_weight`) 定义但在 `loss.py` 中**未使用** — loss.py 有自己硬编码的权重
-- Boundary Loss 用 Laplacian 核 `[[-1,-1,-1],[-1,8,-1],[-1,-1,-1]]` 提取边缘后计算 L1
+- `TotalLoss(cfg)` 使用 `bce_weight × CE + dice_weight × Dice + boundary_weight × Boundary`。
+- 三个权重已接入 config；`bce_pos_weight` 未接入，不能视为正类加权已经生效。
+- Boundary Head 使用 Laplacian 提取的 GT 边缘做 BCEWithLogits。
 
 ### 推理优化
 - **FP16** 全流程（模型 + 归一化常量都用 half）
-- **批量滑窗**: 所有窗口一次前向传播（非逐窗口循环）
+- **批量滑窗**: `crop_size`、`stride`、`infer_batch_size` 均从 config 读取，默认每批1个窗口；短边补灰后裁回，无翻转 TTA
 - 大图自动降采样 0.85× 以减少窗口数
 - 形态学闭运算后处理 (`cv2.MORPH_CLOSE`) 增强边缘连续性
 
@@ -99,6 +100,6 @@ D:/work/anaconda/envs/unet_pro/python -c "from config import cfg; print(cfg)"
 
 ## 已知问题 / 待办
 
-1. **config.py 与 loss.py 的权重不一致**: config 定义了 `bce_weight=0.25`, `dice_weight=0.4`, `boundary_weight=0.2`, `connectivity_weight=0.15`，但 `TotalLoss.__init__()` 硬编码了 `ce_weight=0.55, dice_weight=0.30, boundary_weight=0.15`。`TotalLoss` 构造函数未接收 `cfg` 参数，`connectivity_weight` 未在 loss 中实现。修改 loss 时需同步两处。
-2. `batch_size=4` + `image_size=784` + ViT-B 对显存要求较高（建议 ≥12GB），AMP 已开启。
+1. `bce_pos_weight`、`deep_supervision`、`use_attention`、`use_boundary_head`、`use_multi_layer_features` 等标志未接入对应执行路径；不要假设切换配置即可改变结构。
+2. `batch_size=4` + `image_size=1024` + ViT-B 对显存要求较高（建议 ≥12GB），AMP 已开启。
 3. 权重文件较大（DINOv3 backbone ≈ 350MB），不纳入版本控制。

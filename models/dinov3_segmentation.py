@@ -13,6 +13,7 @@ import torch.nn as nn
 
 from models.dinov3_encoder import DINOv3Encoder
 from models.decoder_v3 import DecoderV3
+from models.detail_encoder import DetailEncoder
 
 
 class DINOv3Seg(nn.Module):
@@ -27,16 +28,20 @@ class DINOv3Seg(nn.Module):
 
         self.decoder = DecoderV3(
             num_classes=cfg.num_classes,
-            feat_dim=768
+            feat_dim=768,
+            use_detail_branch=cfg.use_detail_branch
         )
+        self.detail_encoder = DetailEncoder(cfg.in_channels) if cfg.use_detail_branch else None
 
     def forward(self, x):
 
         feats = self.encoder(x)
+        details = self.detail_encoder(x) if self.detail_encoder is not None else None
 
         seg, boundary = self.decoder(
             feats,
-            output_size=x.shape[2:]
+            output_size=x.shape[2:],
+            details=details
         )
 
         return seg, boundary

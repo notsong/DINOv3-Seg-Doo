@@ -6,6 +6,7 @@ Residual Decoder Block
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class ConvGNAct(nn.Module):
@@ -107,7 +108,7 @@ class UpResidualBlock(nn.Module):
     ResidualBlock
     """
 
-    def __init__(self, in_channels, out_channels):
+    def __init__(self, in_channels, out_channels, skip_channels=None):
         super().__init__()
 
         self.up = nn.Upsample(
@@ -121,9 +122,26 @@ class UpResidualBlock(nn.Module):
             out_channels
         )
 
-    def forward(self, x):
+        # Project before the existing residual block so it refines both paths.
+        # None adds no state_dict keys, preserving the disabled baseline.
+        self.skip_proj = (
+            nn.Sequential(
+                nn.Conv2d(skip_channels, in_channels, 1, bias=False),
+                nn.GroupNorm(8, in_channels)
+            ) if skip_channels is not None else None
+        )
 
-        x = self.up(x)
+    def forward(self, x, skip=None, output_size=None):
+
+        if self.skip_proj is not None:
+            if skip is None:
+                raise ValueError("This decoder stage requires a detail skip")
+            x = F.interpolate(x, size=skip.shape[-2:], mode="bilinear", align_corners=False)
+            x = x + self.skip_proj(skip)
+        elif output_size is not None:
+            x = F.interpolate(x, size=output_size, mode="bilinear", align_corners=False)
+        else:
+            x = self.up(x)
 
         x = self.block(x)
 

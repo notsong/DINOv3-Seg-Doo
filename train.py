@@ -1,6 +1,6 @@
 """
 train.py
-DINOv3 + DecoderV3 — 两阶段训练 + Boundary Head + 日志系统
+DINOv3 + DecoderV3 — 渐进解冻与分层学习率 + Boundary Head + 日志系统
 """
 import os
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
@@ -17,7 +17,8 @@ from models.dinov3_segmentation import DINOv3Seg
 from losses.loss import TotalLoss
 from utils.metric import iou_score, dice_score
 from utils.seed import set_seed
-from utils.scheduler import WarmupCosineScheduler
+from utils.finetuning import build_optimizer, prepare_epoch, set_backbone_train_mode
+from utils.training_checkpoint import make_checkpoint, restore_checkpoint
 from utils.logger import TrainLogger
 
 
@@ -28,6 +29,7 @@ def save_checkpoint(state, path):
 
 def train_one_epoch(model, loader, optimizer, criterion, scaler, device):
     model.train()
+    set_backbone_train_mode(model)
     total_loss = 0
     loop = tqdm(loader, desc="Train")
 
@@ -37,7 +39,7 @@ def train_one_epoch(model, loader, optimizer, criterion, scaler, device):
 
         optimizer.zero_grad()
 
-        with torch.amp.autocast("cuda", enabled=cfg.amp):
+        with torch.amp.autocast(device.type, enabled=cfg.amp and device.type == "cuda"):
             seg, boundary = model(images)
 
         loss = criterion(seg, boundary, masks)
@@ -91,7 +93,8 @@ def main():
           f"epochs={cfg.epochs}, lr={cfg.learning_rate}")
     print(f"Loss: bce={cfg.bce_weight}, dice={cfg.dice_weight}, "
           f"boundary={cfg.boundary_weight}")
-    print(f"Stage1: freeze {cfg.freeze_epochs} epochs → Stage2: unfreeze lr={cfg.unfreeze_lr}")
+    print(f"Progressive: frozen={cfg.freeze_epochs}, last_layers={cfg.partial_unfreeze_layers}, "
+          f"full_epoch={cfg.full_unfreeze_epoch}, backbone_lr={cfg.unfreeze_lr}, decay={cfg.layer_lr_decay}")
 
     # ======================
     # Logger
@@ -136,30 +139,22 @@ def main():
     # ======================
     criterion = TotalLoss(cfg)
 
-    optimizer = torch.optim.AdamW(
-        model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay
-    )
-    scheduler = WarmupCosineScheduler(
-        optimizer, warmup_epochs=cfg.warmup_epochs,
-        total_epochs=cfg.epochs, min_lr=cfg.min_lr
-    )
-    scaler = torch.cuda.amp.GradScaler(enabled=cfg.amp)
+    optimizer = build_optimizer(model, cfg)
+    scaler = torch.amp.GradScaler("cuda", enabled=cfg.amp and device.type == "cuda")
 
     best_iou = 0.0
     best_dice = 0.0
     start_epoch = 0
-    stage2_activated = False
 
     # ======================
     # Resume
     # ======================
-    if cfg.resume and os.path.exists(cfg.resume):
+    if cfg.resume:
         ckpt = torch.load(cfg.resume, map_location=device, weights_only=False)
-        model.load_state_dict(ckpt["model"])
-        optimizer.load_state_dict(ckpt["optimizer"])
-        start_epoch = ckpt.get("epoch", 0) + 1
-        best_iou = ckpt.get("iou", 0.0)
-        best_dice = ckpt.get("dice", 0.0)
+        start_epoch, best_iou, best_dice = restore_checkpoint(
+            ckpt, model, optimizer, scaler, cfg
+        )
+        del ckpt
         print(f"Resumed from epoch {start_epoch}")
 
     os.makedirs(cfg.save_dir, exist_ok=True)
@@ -168,35 +163,11 @@ def main():
     # Training Loop
     # ======================
     for epoch in range(start_epoch, cfg.epochs):
+        stage = prepare_epoch(model, optimizer, cfg, epoch)
         current_lr = optimizer.param_groups[0]['lr']
-
-        # ---- 阶段2切换：解冻backbone ----
-        if epoch == cfg.freeze_epochs and not stage2_activated:
-            stage2_activated = True
-            print(f"\n{'='*50}")
-            print(f"Stage 2: Unfreezing backbone, lr={cfg.unfreeze_lr}")
-            print(f"{'='*50}")
-
-            model.encoder.set_trainable(True)
-
-            # 重建optimizer（更低LR）
-            optimizer = torch.optim.AdamW(
-                model.parameters(), lr=cfg.unfreeze_lr, weight_decay=cfg.weight_decay
-            )
-            # 重建scheduler（剩余epoch用cosine）
-            remaining = cfg.epochs - epoch
-            scheduler = WarmupCosineScheduler(
-                optimizer, warmup_epochs=0,
-                total_epochs=remaining, min_lr=cfg.min_lr
-            )
-
-            trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-            print(f"Params: {trainable:,} trainable / {total:,} total ({100*trainable/total:.1f}%)")
-
-        print(f"\n{'='*50}")
-        print(f"Epoch [{epoch+1}/{cfg.epochs}]  LR: {current_lr:.2e}"
-              f"  {'[Stage2 finetune]' if stage2_activated else '[Stage1 frozen]'}")
-        print(f"{'='*50}")
+        active_backbone_lrs = [g['lr'] for g in optimizer.param_groups if g['name'] != 'head' and g['lr'] > 0]
+        print(f"Epoch [{epoch+1}/{cfg.epochs}] stage={stage} head_lr={current_lr:.2e} "
+              f"backbone_lr={min(active_backbone_lrs, default=0):.2e}..{max(active_backbone_lrs, default=0):.2e}")
 
         train_loss = train_one_epoch(
             model, train_loader, optimizer, criterion, scaler, device
@@ -204,8 +175,6 @@ def main():
         val_loss, val_iou, val_dice = validate(
             model, val_loader, criterion, device
         )
-
-        scheduler.step()
 
         print(f"Train Loss: {train_loss:.4f}")
         print(f"Val   Loss: {val_loss:.4f}")
@@ -215,35 +184,16 @@ def main():
         # ---- log ----
         logger.log_epoch(epoch, train_loss, val_loss, val_iou, val_dice, current_lr)
 
-        # ---- save best IoU ----
-        if val_iou > best_iou and cfg.save_best_iou:
-            best_iou = val_iou
-            save_checkpoint(
-                {"epoch": epoch, "model": model.state_dict(),
-                 "optimizer": optimizer.state_dict(),
-                 "iou": val_iou, "dice": val_dice},
-                os.path.join(cfg.save_dir, "best_iou.pth")
-            )
-            print(f"  -> Saved best_iou.pth (IoU={best_iou:.4f})")
-
-        # ---- save best Dice ----
-        if val_dice > best_dice and cfg.save_best_dice:
-            best_dice = val_dice
-            save_checkpoint(
-                {"epoch": epoch, "model": model.state_dict(),
-                 "optimizer": optimizer.state_dict(),
-                 "iou": val_iou, "dice": val_dice},
-                os.path.join(cfg.save_dir, "best_dice.pth")
-            )
-            print(f"  -> Saved best_dice.pth (Dice={best_dice:.4f})")
-
-        # ---- save latest ----
-        save_checkpoint(
-            {"epoch": epoch, "model": model.state_dict(),
-             "optimizer": optimizer.state_dict(),
-             "iou": val_iou, "dice": val_dice},
-            os.path.join(cfg.save_dir, "last.pth")
-        )
+        improved_iou, improved_dice = val_iou > best_iou, val_dice > best_dice
+        best_iou, best_dice = max(best_iou, val_iou), max(best_dice, val_dice)
+        state = make_checkpoint(model, optimizer, scaler, cfg, epoch,
+                                val_iou, val_dice, best_iou, best_dice)
+        if improved_iou and cfg.save_best_iou:
+            save_checkpoint(state, os.path.join(cfg.save_dir, "best_iou.pth"))
+        if improved_dice and cfg.save_best_dice:
+            save_checkpoint(state, os.path.join(cfg.save_dir, "best_dice.pth"))
+        save_checkpoint(state, os.path.join(cfg.save_dir, "last.pth"))
+        del state
 
     # ======================
     # Plot training curves

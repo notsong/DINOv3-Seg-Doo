@@ -2,7 +2,7 @@
 models/dinov3_encoder.py
 
 DINOv3 Multi-layer Feature Extractor
-输出多尺度 feature maps（取最后3层hidden states）
+输出同分辨率的多层 feature maps（取最后3层hidden states）
 """
 import torch
 import torch.nn as nn
@@ -39,7 +39,8 @@ class DINOv3Encoder(nn.Module):
         """
         Returns:
             feats = {"f4": low-level, "f8": mid-level, "f16": high-level}
-            所有特征空间分辨率相同（ViT patch=14, image_size/14）
+            f4/f8/f16 为兼容旧接口保留的层名，并非下采样倍率。
+            三路网格均为输入高宽整除 backbone.config.patch_size（ViT-B/16 为16）。
         """
         outputs = self.backbone(
             pixel_values=x,
@@ -53,13 +54,18 @@ class DINOv3Encoder(nn.Module):
         f_mid = hs[-2]
         f_high = hs[-1]
 
+        patch_size = self.backbone.config.patch_size
+        H, W = x.shape[-2] // patch_size, x.shape[-1] // patch_size
+        prefix = 1 + self.backbone.config.num_register_tokens
+
         def reshape(feat):
-            B, N, C = feat.shape
-            # DINOv3: [CLS] + patches + 4 register tokens
-            # 取 patches 部分（去掉 CLS 和 register tokens）
-            feat = feat[:, 1:-4, :]  # drop CLS (idx 0) and 4 register tokens (last 4)
-            num_patches = feat.shape[1]
-            H = W = int(num_patches ** 0.5)
+            B, _, C = feat.shape
+            # HuggingFace DINOv3: [CLS] + register tokens + patch tokens
+            feat = feat[:, prefix:, :]
+            if feat.shape[1] != H * W:
+                raise ValueError(
+                    f"Expected {H * W} patch tokens for grid {H}x{W}, got {feat.shape[1]}"
+                )
             feat = feat.reshape(B, H, W, C).permute(0, 3, 1, 2)
             return feat.contiguous()
 

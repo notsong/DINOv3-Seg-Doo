@@ -5,7 +5,7 @@ DINOv3 + Attention Fusion + Residual Decoder + Boundary Head
 
 核心结构：
 1. Attention Fusion (f4, f8, f16)
-2. Residual Decoder (multi-stage upsampling)
+2. Residual Decoder (optional CNN detail skips before residual refinement)
 3. Boundary Head (aux supervision)
 4. Segmentation Head
 """
@@ -21,9 +21,10 @@ from models.boundary_head import BoundaryHead
 
 class DecoderV3(nn.Module):
 
-    def __init__(self, num_classes, feat_dim=768):
+    def __init__(self, num_classes, feat_dim=768, use_detail_branch=False):
 
         super().__init__()
+        self.use_detail_branch = use_detail_branch
 
         # =========================
         # 1. Fusion
@@ -42,9 +43,9 @@ class DecoderV3(nn.Module):
         # =========================
         # 3. Residual Decoder
         # =========================
-        self.dec1 = UpResidualBlock(512, 256)
-        self.dec2 = UpResidualBlock(256, 128)
-        self.dec3 = UpResidualBlock(128, 64)
+        self.dec1 = UpResidualBlock(512, 256, skip_channels=64 if use_detail_branch else None)
+        self.dec2 = UpResidualBlock(256, 128, skip_channels=32 if use_detail_branch else None)
+        self.dec3 = UpResidualBlock(128, 64, skip_channels=16 if use_detail_branch else None)
         self.dec4 = UpResidualBlock(64, 32)
 
         # =========================
@@ -57,7 +58,7 @@ class DecoderV3(nn.Module):
         # =========================
         self.boundary_head = BoundaryHead(32)
 
-    def forward(self, feats, output_size=None):
+    def forward(self, feats, output_size=None, details=None):
 
         """
         feats:
@@ -66,6 +67,8 @@ class DecoderV3(nn.Module):
                 f8
                 f16
         """
+        if self.use_detail_branch and details is None:
+            raise ValueError("Detail-enabled decoder requires detail features")
 
         f4 = feats["f4"]
         f8 = feats["f8"]
@@ -84,10 +87,16 @@ class DecoderV3(nn.Module):
         # =========================
         # Decoder
         # =========================
-        x = self.dec1(x)
-        x = self.dec2(x)
-        x = self.dec3(x)
-        x = self.dec4(x)
+        if self.use_detail_branch:
+            x = self.dec1(x, skip=details['d8'])
+            x = self.dec2(x, skip=details['d4'])
+            x = self.dec3(x, skip=details['d2'])
+            x = self.dec4(x, output_size=output_size)
+        else:
+            x = self.dec1(x)
+            x = self.dec2(x)
+            x = self.dec3(x)
+            x = self.dec4(x)
 
         # =========================
         # Heads

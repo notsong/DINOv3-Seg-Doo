@@ -5,7 +5,7 @@ DINOv3 + DecoderV3 极速推理
 - Letterbox 无形变 resize（保持宽高比 + 灰条填充）
 - 推理后自动去除灰条、还原尺寸
 - FP16 推理
-- 批量滑窗（单次前向处理所有窗口）
+- 有界分批滑窗（每个窗口仅前向一次，无翻转 TTA）
 - 大图自动降采样减少窗口数
 - 形态学后处理增强连续性
 - Boundary Head 输出丢弃，仅用 Seg
@@ -117,53 +117,51 @@ def single_infer(model, image, device):
         seg, _ = model(inp)
         prob = torch.softmax(seg, dim=1)[0, 1].float().cpu().numpy()
 
-        # TTA: 水平翻转消除左右不对称
-        inp_flip = torch.flip(inp, dims=[3])
-        seg_flip, _ = model(inp_flip)
-        prob_flip = torch.softmax(seg_flip, dim=1)[0, 1].float().cpu().numpy()
-        prob_flip = np.fliplr(prob_flip)
-        prob = (prob + prob_flip) / 2.0
-
     # 去除灰条 + 还原尺寸
     prob = unletterbox(prob, pads, (orig_w, orig_h))
     return prob
 
 
-def batched_sliding(model, image, device, crop=1024, stride=768):
-    """批量滑窗：所有窗口一次前向"""
+def batched_sliding(model, image, device, crop=None, stride=None):
+    """有界分批滑窗；短边补灰，回填时裁去补边，保持原始像素位置。"""
+    crop = cfg.crop_size if crop is None else crop
+    stride = cfg.stride if stride is None else stride
+    batch_size = cfg.infer_batch_size
+    if crop <= 0 or stride <= 0 or stride > crop or batch_size <= 0:
+        raise ValueError("Require crop > 0, 0 < stride <= crop and infer_batch_size > 0")
     h, w = image.shape[:2]
-    xs = sorted(set(min(x, w - crop) for x in range(0, w, stride)))
-    ys = sorted(set(min(y, h - crop) for y in range(0, h, stride)))
-
-    patches, positions = [], []
-    for y1 in ys:
-        for x1 in xs:
-            patch = image[y1:y1+crop, x1:x1+crop]
-            if patch.shape[0] != crop or patch.shape[1] != crop:
-                patch = cv2.resize(patch, (crop, crop))
-            patches.append(patch.astype(np.float32) / 255.0)
-            positions.append((y1, x1))
-
-    batch = torch.from_numpy(np.stack(patches)).permute(0, 3, 1, 2).half().to(device)
-    batch = (batch - MEAN.to(device)) / STD.to(device)
-
-    with torch.no_grad():
-        seg, _ = model(batch)
-        probs = torch.softmax(seg, dim=1)[:, 1].float().cpu().numpy()
-
-        # TTA: 水平翻转消除左右不对称
-        batch_flip = torch.flip(batch, dims=[3])
-        seg_flip, _ = model(batch_flip)
-        probs_flip = torch.softmax(seg_flip, dim=1)[:, 1].float().cpu().numpy()
-        probs = (probs + np.fliplr(probs_flip)) / 2.0
-
+    if h == 0 or w == 0:
+        raise ValueError("Image must have nonempty height and width")
+    xs = sorted(set(min(x, max(0, w - crop)) for x in range(0, w, stride)))
+    ys = sorted(set(min(y, max(0, h - crop)) for y in range(0, h, stride)))
+    positions = [(y, x) for y in ys for x in xs]
     prob_map = np.zeros((h, w), dtype=np.float32)
     count_map = np.zeros((h, w), dtype=np.float32)
-    for (y1, x1), prob in zip(positions, probs):
-        prob_map[y1:y1+crop, x1:x1+crop] += prob
-        count_map[y1:y1+crop, x1:x1+crop] += 1
 
-    return prob_map / (count_map + 1e-6)
+    for start in range(0, len(positions), batch_size):
+        current = positions[start:start + batch_size]
+        patches = []
+        for y1, x1 in current:
+            patch = image[y1:y1 + crop, x1:x1 + crop]
+            ph, pw = patch.shape[:2]
+            if ph < crop or pw < crop:
+                patch = cv2.copyMakeBorder(
+                    patch, 0, crop - ph, 0, crop - pw,
+                    cv2.BORDER_CONSTANT, value=GRAY
+                )
+            patches.append(patch.astype(np.float32) / 255.0)
+        batch = torch.from_numpy(np.stack(patches)).permute(0, 3, 1, 2).half().to(device)
+        batch = (batch - MEAN.to(device)) / STD.to(device)
+        with torch.no_grad():
+            seg, boundary = model(batch)
+            probs = torch.softmax(seg, dim=1)[:, 1].float().cpu().numpy()
+        del batch, seg, boundary
+        for (y1, x1), prob in zip(current, probs):
+            ph, pw = min(crop, h - y1), min(crop, w - x1)
+            prob_map[y1:y1 + ph, x1:x1 + pw] += prob[:ph, :pw]
+            count_map[y1:y1 + ph, x1:x1 + pw] += 1
+
+    return prob_map / count_map
 
 
 SCALE = 0.85  # 大图缩放比例（速度/质量平衡）

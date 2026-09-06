@@ -119,7 +119,7 @@ class AttentionFusion(nn.Module):
     输出:
         fused feature
 
-    自动学习三个尺度的重要性
+    自动学习最后三层同分辨率特征的重要性
     """
 
     def __init__(self, channels):
