@@ -28,7 +28,9 @@ def main():
             x = torch.randn(1, 3, h, w, device=device)
             raw = model.encoder.backbone(pixel_values=x, output_hidden_states=True).hidden_states
             feats = model.encoder(x)
-            for key, state in zip(('f4', 'f8', 'f16'), raw[-3:]):
+            states = raw[-model.encoder.num_layers:]
+            for key in model.encoder.feature_layers:
+                state = states[key - 1]
                 expected = state[:, 5:].transpose(1, 2).reshape(1, 768, h // 16, w // 16)
                 torch.testing.assert_close(feats[key], expected)
             seg, boundary = model(x)

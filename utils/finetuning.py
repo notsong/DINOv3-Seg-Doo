@@ -8,7 +8,7 @@ POLICY_FIELDS = (
     'epochs', 'freeze_backbone', 'freeze_epochs', 'partial_unfreeze_layers',
     'full_unfreeze_epoch', 'learning_rate', 'unfreeze_lr', 'layer_lr_decay',
     'warmup_epochs', 'finetune_warmup_epochs', 'min_lr', 'weight_decay',
-    'use_detail_branch',
+    'use_detail_branch', 'feature_layers',
 )
 
 

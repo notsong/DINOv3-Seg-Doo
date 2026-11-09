@@ -6,6 +6,9 @@ from dataclasses import dataclass
 import os
 
 
+DEFAULT_FEATURE_LAYERS = (3, 6, 9, 12)
+
+
 @dataclass
 class Config:
 
@@ -36,6 +39,8 @@ class Config:
     in_channels: int = 3
 
     image_size: int = 1024  # ViT-B/16: 64×64 patch 网格
+
+    feature_layers: tuple[int, int, int, int] = DEFAULT_FEATURE_LAYERS  # Transformer 层号，从 1 开始
 
     use_multi_layer_features: bool = True
 

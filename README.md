@@ -18,7 +18,7 @@
   - [5. ONNX 导出](#5-onnx-导出)
 - [核心设计](#核心设计)
   - [Encoder：DINOv3 多层特征提取](#encoderdinov3-多层特征提取)
-  - [Decoder：FPN + UNet 混合结构](#decoderfpn--unet-混合结构)
+  - [Decoder：注意力融合与残差上采样](#decoder注意力融合与残差上采样)
   - [损失函数：三合一组合 Loss](#损失函数三合一组合-loss)
   - [学习率调度：Warmup + Cosine](#学习率调度warmup--cosine)
   - [滑窗推理](#滑窗推理)
@@ -45,8 +45,8 @@
 ```text
 输入图像 [B, 3, H, W]（默认1024×1024）
   ↓ DINOv3 ViT-B/16
-最后三层 f4/f8/f16：均为 [B, 768, H//16, W//16]
-  ↓ 每层 CBAM + 可学习加权融合
+第 3、6、9、12 层：均为 [B, 768, H//16, W//16]
+  ↓ 四个独立 CBAM + Softmax 加权融合
 同分辨率特征融合 → 768通道
   ↓ 1×1 投影 → 512通道
 四级残差上采样 → 256 → 128 → 64 → 32通道
@@ -59,8 +59,8 @@
 | 组件 | 参数 |
 |------|------|
 | Backbone | `facebook/dinov3-vitb16-pretrain-lvd1689m` |
-| 输入尺寸 | 768×768 |
-| FPN 通道数 | 256 |
+| 输入尺寸 | 1024×1024 |
+| 解码器输入投影 | 512 通道 |
 | 解码器通道数 | 256→128→64→32 |
 | 参数量（骨干冻结） | ~15M（仅解码器可训练） |
 
@@ -75,7 +75,7 @@
 │
 ├── models/
 │   ├── dinov3_encoder.py     # DINOv3 多层特征提取器
-│   ├── fpn_unet_decoder.py   # FPN + UNet 混合解码器
+│   ├── decoder_v3.py        # 四路注意力融合与残差解码器
 │   └── dinov3_segmentation.py # 完整模型（Encoder + Decoder）
 │
 ├── losses/
@@ -201,19 +201,11 @@ python export_onnx.py
 
 ### Encoder：DINOv3 多层特征提取
 
-不同于常见的仅取最后一层特征，本项目从 DINOv3 的 hidden states 中提取 **最后三层、同一空间分辨率** 的特征：
+`feature_layers` 默认取 ViT-B/16 的 **第 3、6、9、12 个 Transformer 层**，层号从 1 开始。四路特征覆盖不同网络深度，使用相同的空间网格。编码器去掉 CLS 和 register token 后，把每层 patch 序列还原成 `[B, C, H//16, W//16]`。默认输入下每路都是 64×64。
 
-| 层级 | 来源 | 下采样倍率 | 语义 |
-|------|------|-----------|------|
-| f4 | hidden_states[-3] | 16× | 低级纹理（目标边缘细节） |
-| f8 | hidden_states[-2] | 16× | 中级结构（目标形状） |
-| f16 | hidden_states[-1] | 16× | 高级语义（目标区域） |
+### Decoder：注意力融合与残差上采样
 
-特征从 `[B, N, C]` (patch sequence) reshape 为 `[B, C, H, W]` 空间格式，按真实配置丢弃前面的 CLS 和 register tokens。网格高宽由输入高宽分别整除 patch_size 得到；f4/f8/f16 仅为兼容层名，不代表真实金字塔。默认冻结骨干网络，仅训练解码器，避免在小数据集上过拟合。
-
-### Decoder：FPN + UNet 混合结构
-
-1. **特征融合**：最后三层同分辨率特征分别经过 CBAM，再以可学习权重融合。
+1. **特征融合**：四路特征各经过一个独立的 CBAM，再以四个经 Softmax 归一化的可学习权重求和。初始权重均为 0.25。
 2. **残差解码**：投影到512通道，四级2×上采样，通道依次为256、128、64、32。
 3. **输出头**：分割头和边界辅助头分别输出，最后插值到输入尺寸。
 
@@ -273,6 +265,7 @@ Total Loss = 0.4 × BCE + 0.4 × Dice + 0.2 × Boundary
 | `dataset_root` | `"./dataset"` | 数据集根目录 |
 | `backbone_name` | `"facebook/dinov3-vitb16-pretrain-lvd1689m"` | DINOv3 模型名称（HuggingFace） |
 | `image_size` | `1024` | 训练/推理输入尺寸 |
+| `feature_layers` | `(3, 6, 9, 12)` | 四个递增的 Transformer 层号，从 1 开始 |
 | `batch_size` | `4` | 批次大小 |
 | `epochs` | `100` | 总训练轮数 |
 | `learning_rate` | `1e-4` | 初始学习率 |
@@ -299,7 +292,7 @@ Total Loss = 0.4 × BCE + 0.4 × Dice + 0.2 × Boundary
 运行 `python -m unittest discover -s tests -v`，无需真实权重或 GPU。
 可选运行 `python tests/smoke_local.py`，读取 config 中的本地 backbone 权重，检查非方形网格与 FP16 推理；解码器随机初始化，不用于精度评价。
 
-特征排列修复改变了旧权重依赖的空间对应关系，需要重训后评估细晶界和小目标精度，不能据此承诺旧权重精度提升。
+三路 CBAM 的旧整模型权重和训练断点需要在对应旧版本使用。四路模型可以从相同的 DINOv3 预训练骨干开始训练。使用四路权重推理或续训时，`feature_layers` 应与训练配置匹配。
 `bce_pos_weight`、`deep_supervision` 当前仅定义而未接入执行；本次未改变训练损失策略。
 
 
@@ -309,9 +302,9 @@ Total Loss = 0.4 × BCE + 0.4 × Dice + 0.2 × Boundary
 
 CNN分支不随DINOv3冻结，现有优化器会自动训练其参数。分割和边界双输出接口不变，损失策略不变。新分支加跳跃投影共新增117,104个参数。
 
-加载旧结构完整检查点时，将 `use_detail_branch=False`，该路径保留旧参数键与原始解码数值行为（编码器仍采用修复后的正确排列）。新结构需训练后使用，不能将旧检查点用 `strict=False` 静默加载后当作训练完成的新模型。新结构恢复训练/推理时应保持开关为True。
+如需训练四路结构的无细节分支版本，可设置 `use_detail_branch=False`。加载四路检查点时，使用与训练时相同的开关。
 
-`python -m unittest discover -s tests -v` 验证开关、奇数尺寸、梯度、优化器参数与严格检查点兼容；`python tests/smoke_local.py` 另做真实骨干前向和一次混合精度反向（不更新参数、不启动训练）；`python tests/benchmark_decoder.py` 测量合成256×256输入的解码器与细节分支开销，不含骨干和数据预处理，不代表完整推理耗时。
+`python -m unittest discover -s tests -v` 验证选层、四路 CBAM 梯度、奇数尺寸和检查点恢复。`python tests/smoke_local.py` 用本地骨干做前向和一次反向检查。`python tests/benchmark_decoder.py` 测量合成 256×256 输入下解码器与细节分支的开销。
 
 
 ### 本地轻量验证

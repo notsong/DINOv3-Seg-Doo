@@ -110,27 +110,14 @@ class CBAM(nn.Module):
 # ==========================================================
 
 class AttentionFusion(nn.Module):
-    """
-    输入:
-        f4
-        f8
-        f16
+    """逐层应用独立的 CBAM，再学习同分辨率特征的融合权重。"""
 
-    输出:
-        fused feature
-
-    自动学习最后三层同分辨率特征的重要性
-    """
-
-    def __init__(self, channels):
+    def __init__(self, channels, feature_layers):
 
         super().__init__()
 
-        self.cbam4 = CBAM(channels)
-        self.cbam8 = CBAM(channels)
-        self.cbam16 = CBAM(channels)
-
-        self.weight = nn.Parameter(torch.ones(3))
+        self.cbam = nn.ModuleDict({str(layer): CBAM(channels) for layer in feature_layers})
+        self.weight = nn.Parameter(torch.ones(len(feature_layers)))
 
         self.fuse = nn.Sequential(
 
@@ -159,22 +146,10 @@ class AttentionFusion(nn.Module):
             nn.GELU()
         )
 
-    def forward(self, f4, f8, f16):
-
-        f4 = self.cbam4(f4)
-
-        f8 = self.cbam8(f8)
-
-        f16 = self.cbam16(f16)
-
-        w = F.softmax(self.weight, dim=0)
-
-        out = (
-            w[0] * f4 +
-            w[1] * f8 +
-            w[2] * f16
+    def forward(self, feats):
+        weights = F.softmax(self.weight, dim=0)
+        fused = sum(
+            weights[index] * cbam(feats[int(layer)])
+            for index, (layer, cbam) in enumerate(self.cbam.items())
         )
-
-        out = self.fuse(out)
-
-        return out
+        return self.fuse(fused)

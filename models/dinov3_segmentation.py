@@ -23,13 +23,15 @@ class DINOv3Seg(nn.Module):
 
         self.encoder = DINOv3Encoder(
             cfg.backbone_name,
-            trainable=not cfg.freeze_backbone
+            trainable=not cfg.freeze_backbone,
+            feature_layers=cfg.feature_layers,
         )
 
         self.decoder = DecoderV3(
             num_classes=cfg.num_classes,
             feat_dim=768,
-            use_detail_branch=cfg.use_detail_branch
+            use_detail_branch=cfg.use_detail_branch,
+            feature_layers=cfg.feature_layers,
         )
         self.detail_encoder = DetailEncoder(cfg.in_channels) if cfg.use_detail_branch else None
 

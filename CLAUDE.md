@@ -1,8 +1,8 @@
-# CLAUDE.md — DINOv3 + FPN-UNet 工业边缘语义分割
+# CLAUDE.md — DINOv3 工业边缘语义分割
 
 ## 项目概述
 
-基于 DINOv3（ViT-B/16）作为特征提取骨干，结合 FPN + UNet 混合解码器的工业级边缘分割方案。专为工业图像的目标边缘检测设计。
+基于 DINOv3（ViT-B/16）特征骨干、注意力融合和残差解码器，用于工业图像边缘分割。
 
 ## 技术栈
 
@@ -24,8 +24,8 @@
 │   ├── dataset_loader.py       # SegDataset（有标注） + UnlabeledDataset
 │   └── transforms.py          # Albumentations 训练/验证增强
 ├── models/
-│   ├── dinov3_encoder.py      # DINOv3 多层特征提取（f4/f8/f16）
-│   ├── fpn_unet_decoder.py    # FPN 投影 + 4级×2上采样解码器
+│   ├── dinov3_encoder.py      # DINOv3 多层特征提取（默认第 3、6、9、12 层）
+│   ├── decoder_v3.py         # 四路注意力融合 + 四级残差上采样
 │   └── dinov3_segmentation.py # 顶层模型 = Encoder + Decoder
 ├── losses/
 │   └── loss.py                # TotalLoss = CE + Dice + Boundary
@@ -62,13 +62,13 @@ D:/work/anaconda/envs/unet_pro/python -c "from config import cfg; print(cfg)"
 ### Encoder: DINOv3 特征提取
 - **Backbone**: `facebook/dinov3-vitb16-pretrain-lvd1689m`
 - **patch_size=16**（以 backbone 配置为准），默认输入 `image_size=1024`，网格为64×64；非方形输入分别计算高宽
-- 取最后 3 层 hidden_states，token 顺序为 CLS、register、patch；按配置去掉前面的 CLS 和 register tokens
+- 默认取第 3、6、9、12 个 Transformer 层，按配置去掉前面的 CLS 和 register tokens
 - 所有层级输出相同空间分辨率 `[B, 768, H//16, W//16]`（ViT 不像 CNN 有下采样金字塔）
 
 ### Decoder: DecoderV3
 - 默认 `use_detail_branch=True`：浅层CNN提供1/2、1/4、1/8细节，在前三次上采样后、残差块前投影相加。该开关已接入执行。
 - 旧结构检查点需关闭细节开关；新结构需训练，不允许静默忽略缺失权重。
-- 最后三层同分辨率特征分别经过 CBAM，再可学习加权融合。
+- 四路同分辨率特征各经过独立的 CBAM，再以 Softmax 归一化的可学习权重融合。
 - 1×1 投影至512通道，四级残差上采样：512→256→128→64→32。
 - Segmentation Head 输出2通道，Boundary Head 输出1通道，最后插值到输入尺寸。
 

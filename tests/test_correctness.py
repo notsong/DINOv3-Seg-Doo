@@ -7,43 +7,51 @@ import torch
 from torch import nn
 
 import infer
+from config import DEFAULT_FEATURE_LAYERS
 from models.dinov3_encoder import DINOv3Encoder
 
 
 class TokenBackbone(nn.Module):
-    def __init__(self, registers=4, patch_size=16, extra=0):
+    def __init__(self, registers=4, patch_size=16, extra=0, include_embedding=True):
         super().__init__()
-        self.config = SimpleNamespace(num_register_tokens=registers, patch_size=patch_size)
+        self.config = SimpleNamespace(num_register_tokens=registers, patch_size=patch_size, num_hidden_layers=12)
         self.extra = extra
+        self.include_embedding = include_embedding
 
     def forward(self, pixel_values, output_hidden_states):
         b, _, h, w = pixel_values.shape
         n = (h // self.config.patch_size) * (w // self.config.patch_size)
         prefix = torch.full((b, 1 + self.config.num_register_tokens, 2), -999.)
         tokens = torch.arange(n + self.extra).float().view(1, -1, 1).expand(b, -1, 2)
+        first = 0 if self.include_embedding else 1
         return SimpleNamespace(hidden_states=tuple(
-            torch.cat((prefix, tokens + offset), dim=1) for offset in (0, 100, 200)))
+            torch.cat((prefix, tokens + layer * 100), dim=1) for layer in range(first, 13)))
 
 
 class EncoderTests(unittest.TestCase):
-    def check_grid(self, h, w, registers=4, patch_size=16):
+    def make_encoder(self, backbone, layers=DEFAULT_FEATURE_LAYERS):
         with patch('models.dinov3_encoder.AutoImageProcessor.from_pretrained'), patch(
             'models.dinov3_encoder.AutoModel.from_pretrained',
-            return_value=TokenBackbone(registers, patch_size)
+            return_value=backbone
         ):
-            encoder = DINOv3Encoder('unused')
+            return DINOv3Encoder('unused', feature_layers=layers)
+
+    def check_grid(self, h, w, registers=4, patch_size=16, include_embedding=True):
+        encoder = self.make_encoder(TokenBackbone(registers, patch_size, include_embedding=include_embedding))
         result = encoder(torch.zeros(2, 3, h, w))
         gh, gw = h // patch_size, w // patch_size
         expected = torch.arange(gh * gw).float().reshape(gh, gw)
-        for key, offset in zip(('f4', 'f8', 'f16'), (0, 100, 200)):
-            self.assertEqual(result[key].shape, (2, 2, gh, gw))
-            torch.testing.assert_close(result[key][:, 0], (expected + offset).expand(2, -1, -1))
+        self.assertEqual(tuple(result), (3, 6, 9, 12))
+        for layer, feature in result.items():
+            self.assertEqual(feature.shape, (2, 2, gh, gw))
+            torch.testing.assert_close(feature[:, 0], (expected + layer * 100).expand(2, -1, -1))
 
     def test_square_spatial_order(self):
         self.check_grid(32, 32)
 
     def test_rectangular_spatial_order(self):
         self.check_grid(32, 48)
+        self.check_grid(32, 48, include_embedding=False)
 
     def test_nondivisible_input_uses_convolution_grid(self):
         self.check_grid(35, 51)
@@ -53,11 +61,14 @@ class EncoderTests(unittest.TestCase):
         self.check_grid(16, 24, registers=2, patch_size=8)
 
     def test_inconsistent_token_count_is_rejected(self):
-        encoder = DINOv3Encoder.__new__(DINOv3Encoder)
-        nn.Module.__init__(encoder)
-        encoder.backbone = TokenBackbone(extra=1)
+        encoder = self.make_encoder(TokenBackbone(extra=1))
         with self.assertRaisesRegex(ValueError, 'patch tokens'):
             encoder(torch.zeros(1, 3, 32, 48))
+
+    def test_invalid_layer_numbers_are_rejected(self):
+        for layers in ((3, 6, 12), (3, 6, 6, 12), (0, 6, 9, 12), (3, 6, 9, 13)):
+            with self.subTest(layers=layers), self.assertRaisesRegex(ValueError, 'feature_layers'):
+                self.make_encoder(TokenBackbone(), layers=layers)
 
 
 class PixelModel(nn.Module):

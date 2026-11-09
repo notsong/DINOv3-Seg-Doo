@@ -4,7 +4,8 @@ from unittest.mock import patch
 import torch
 from torch import nn
 
-from config import Config
+from config import Config, DEFAULT_FEATURE_LAYERS
+from models.attention import AttentionFusion
 from models.decoder_v3 import DecoderV3
 from models.dinov3_segmentation import DINOv3Seg
 from models.residual_block import UpResidualBlock
@@ -12,14 +13,15 @@ from models.residual_block import UpResidualBlock
 
 class FakeEncoder(nn.Module):
     """No weight files: trainability mirrors the production constructor."""
-    def __init__(self, model_name, trainable=False):
+    def __init__(self, model_name, trainable=False, feature_layers=DEFAULT_FEATURE_LAYERS):
         super().__init__()
+        self.feature_layers = feature_layers
         self.proj = nn.Conv2d(3, 768, 16, stride=16)
         self.proj.requires_grad_(trainable)
 
     def forward(self, x):
         f = self.proj(x)
-        return dict(f4=f, f8=f, f16=f)
+        return {layer: f for layer in self.feature_layers}
 
 
 def make_model(enabled):
@@ -62,7 +64,7 @@ class DetailTests(unittest.TestCase):
 
     def test_enabled_decoder_rejects_missing_details(self):
         model = make_model(True)
-        feats = {k: torch.randn(1, 768, 2, 3) for k in ('f4', 'f8', 'f16')}
+        feats = {layer: torch.randn(1, 768, 2, 3) for layer in DEFAULT_FEATURE_LAYERS}
         with self.assertRaisesRegex(ValueError, 'detail'):
             model.decoder(feats, output_size=(32, 48))
 
@@ -81,24 +83,35 @@ class DetailTests(unittest.TestCase):
             self.assertGreater(param.grad.abs().sum().item(), 0, name)
         self.assertTrue(all(p.grad is None for p in model.encoder.parameters()))
 
-    def test_disabled_path_strict_load_and_numerical_baseline(self):
+    def test_disabled_path_matches_decoder_without_detail_skips(self):
         model = make_model(False).eval()
         self.assertIsNone(getattr(model, 'detail_encoder', None))
         self.assertFalse(any('detail' in k or 'skip' in k for k in model.state_dict()))
-        legacy = DecoderV3(num_classes=2).eval()
-        legacy.load_state_dict(model.decoder.state_dict(), strict=True)
+        decoder = DecoderV3(num_classes=2).eval()
+        decoder.load_state_dict(model.decoder.state_dict(), strict=True)
         x = torch.randn(1, 3, 35, 51)
         with torch.no_grad():
             feats = model.encoder(x)
-            # Explicit original decoder flow is the independent baseline oracle.
-            y = legacy.proj(legacy.fusion(feats['f4'], feats['f8'], feats['f16']))
-            for block in (legacy.dec1, legacy.dec2, legacy.dec3, legacy.dec4):
+            y = decoder.proj(decoder.fusion(feats))
+            for block in (decoder.dec1, decoder.dec2, decoder.dec3, decoder.dec4):
                 y = block.block(block.up(y))
             expected = tuple(nn.functional.interpolate(head(y), size=x.shape[2:], mode='bilinear', align_corners=False)
-                             for head in (legacy.seg_head, legacy.boundary_head))
+                             for head in (decoder.seg_head, decoder.boundary_head))
             actual = model(x)
         for a, b in zip(actual, expected):
             torch.testing.assert_close(a, b, rtol=0, atol=0)
+
+    def test_four_cbams_receive_gradients(self):
+        fusion = AttentionFusion(16, DEFAULT_FEATURE_LAYERS)
+        feats = {layer: torch.randn(1, 16, 3, 5, requires_grad=True) for layer in DEFAULT_FEATURE_LAYERS}
+        self.assertEqual(tuple(fusion.cbam), ('3', '6', '9', '12'))
+        torch.testing.assert_close(fusion.weight.softmax(0), torch.full((4,), 0.25))
+        fusion(feats).square().mean().backward()
+        self.assertGreater(fusion.weight.grad.abs().sum().item(), 0)
+        for layer, feature in feats.items():
+            self.assertGreater(feature.grad.abs().sum().item(), 0, layer)
+            self.assertTrue(any(p.grad is not None and p.grad.abs().sum() > 0
+                                for p in fusion.cbam[str(layer)].parameters()), layer)
 
     def test_new_structure_strict_checkpoint_roundtrip(self):
         model = make_model(True).eval()

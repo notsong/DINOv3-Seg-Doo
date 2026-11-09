@@ -4,7 +4,7 @@ models/decoder_v3.py
 DINOv3 + Attention Fusion + Residual Decoder + Boundary Head
 
 核心结构：
-1. Attention Fusion (f4, f8, f16)
+1. Four-layer Attention Fusion
 2. Residual Decoder (optional CNN detail skips before residual refinement)
 3. Boundary Head (aux supervision)
 4. Segmentation Head
@@ -14,6 +14,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from config import DEFAULT_FEATURE_LAYERS
 from models.attention import AttentionFusion
 from models.residual_block import ResidualBlock, UpResidualBlock
 from models.boundary_head import BoundaryHead
@@ -21,7 +22,8 @@ from models.boundary_head import BoundaryHead
 
 class DecoderV3(nn.Module):
 
-    def __init__(self, num_classes, feat_dim=768, use_detail_branch=False):
+    def __init__(self, num_classes, feat_dim=768, use_detail_branch=False,
+                 feature_layers=DEFAULT_FEATURE_LAYERS):
 
         super().__init__()
         self.use_detail_branch = use_detail_branch
@@ -29,7 +31,7 @@ class DecoderV3(nn.Module):
         # =========================
         # 1. Fusion
         # =========================
-        self.fusion = AttentionFusion(feat_dim)
+        self.fusion = AttentionFusion(feat_dim, feature_layers)
 
         # =========================
         # 2. Channel Projection
@@ -60,24 +62,14 @@ class DecoderV3(nn.Module):
 
     def forward(self, feats, output_size=None, details=None):
 
-        """
-        feats:
-            dict:
-                f4
-                f8
-                f16
-        """
+        """按层号读取骨干特征，并融合可选的局部细节特征。"""
         if self.use_detail_branch and details is None:
             raise ValueError("Detail-enabled decoder requires detail features")
-
-        f4 = feats["f4"]
-        f8 = feats["f8"]
-        f16 = feats["f16"]
 
         # =========================
         # Fusion
         # =========================
-        x = self.fusion(f4, f8, f16)
+        x = self.fusion(feats)
 
         # =========================
         # Projection

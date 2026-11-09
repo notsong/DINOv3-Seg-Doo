@@ -32,7 +32,8 @@ def main():
                 detail.half()
         dtype = next(decoder.parameters()).dtype
         image = torch.randn(1, 3, 256, 256, device=device, dtype=dtype)
-        feats = {k: torch.randn(1, 768, 16, 16, device=device, dtype=dtype) for k in ('f4', 'f8', 'f16')}
+        feats = {int(layer): torch.randn(1, 768, 16, 16, device=device, dtype=dtype)
+                 for layer in decoder.fusion.cbam}
         conv_macs = {}
         handles = []
 
